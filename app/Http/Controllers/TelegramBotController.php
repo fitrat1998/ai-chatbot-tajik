@@ -10,24 +10,26 @@ use Illuminate\Support\Facades\Cache;
 
 class TelegramBotController extends Controller
 {
-    // Kanal ma'lumotlari (to'g'ridan-to'g'ri controller ichida)
+    // Kanal ma'lumotlari
     protected $channels = [
         [
-            'id' => 'barnomahoyi_tojiki', // Kanal 1 username yoki ID
-            'link' => 'https://t.me/barnomahoyi_tojiki' // Kanal 1 havolasi
+            'id' => '@barnomahoyi_tojiki', // Kanal ID (username o‘rniga ID ishlatish yaxshiroq)
+            'link' => 'https://t.me/barnomahoyi_tojiki'
         ],
         [
-            'id' => 'mirkomil_kuhistoniy_blog', // Kanal 2 username yoki ID
-            'link' => 'https://t.me/mirkomil_kuhistoniy_blog' // Kanal 2 havolasi
-        ],
-        // Qo'shimcha kanallar qo'shishingiz mumkin
+            'id' => '@mirkomil_kuhistoniy_blog', // Username formatida
+            'link' => 'https://t.me/mirkomil_kuhistoniy_blog'
+        ]
     ];
 
     public function handle(Request $request)
     {
         Log::info('Telegramdan kelgan so‘rov: ', $request->all());
 
-        $update = Telegram::commandsHandler(true);
+        // Bu qatorni olib tashlang yoki false qilib qo‘ying
+        // $update = Telegram::commandsHandler(false);
+
+        $update = Telegram::getWebhookUpdates();
 
         // Agar callback_query bo'lsa
         if (isset($update['callback_query'])) {
@@ -58,117 +60,124 @@ class TelegramBotController extends Controller
         $this->handleGeminiRequest($chatId, $text);
     }
 
-protected function handleStartCommand($chatId, $userId)
-{
-    $message = Telegram::getChat(['chat_id' => $chatId]);
-    $firstName = $message['first_name'] ?? 'Дӯст';
 
-    // Barcha kanallarga a'zoligini tekshirish
-    $notSubscribedChannels = [];
-    $buttons = [];
+    protected function handleStartCommand($chatId, $userId)
+    {
+        $message = Telegram::getChat(['chat_id' => $chatId]);
+        $firstName = $message['first_name'] ?? 'Дӯст';
 
-    foreach ($this->channels as $channel) {
-        if (!$this->isUserMemberOfChannel($chatId, $userId, $channel['id'])) {
-            $notSubscribedChannels[] = $channel['link'];
-            $buttons[] = [['text' => "🔗 " . basename($channel['link']), 'url' => $channel['link']]];
+        Telegram::sendChatAction([
+            'chat_id' => $chatId,
+            'action' => 'typing'
+        ]);
+
+        // Oldin cache tekshiramiz
+        if ($this->isUserSubscribed($userId)) {
+            Telegram::sendMessage([
+                'chat_id' => $chatId,
+                'text' => "Салом, $firstName! Ман як боти ёрдамчи ҳастам. Саволҳои худро ба ман нависед."
+            ]);
+            return;
         }
-    }
 
-    // Agar foydalanuvchi barcha kanallarga a'zo bo'lsa
-    if (empty($notSubscribedChannels)) {
+
+        // Kanalga aʼzo ekanligini tekshiramiz
+        $notSubscribedChannels = [];
+        $buttons = [];
+
+        foreach ($this->channels as $channel) {
+            if (!$this->isUserMemberOfChannel($userId, $channel['id'])) {
+                $notSubscribedChannels[] = $channel['link'];
+                $buttons[] = [['text' => "🔗 " . basename($channel['link']), 'url' => $channel['link']]];
+            }
+        }
+
+        if (empty($notSubscribedChannels)) {
+            $this->saveUserSubscription($userId);
+
+            Telegram::sendMessage([
+                'chat_id' => $chatId,
+                'text' => "Салом, $firstName! Ман як боти ёрдамчи ҳастам. Саволҳои худро ба ман нависед."
+            ]);
+            return;
+        }
+
+
+        // Kanalga a'zo bo'lishni talab qilish
+        $messageText = "Салом, $firstName! Барои истифодаи бот, лутфан каналларга аъзо бўлинг:";
+
         Telegram::sendMessage([
             'chat_id' => $chatId,
-            'text' => "Салом, $firstName! Ман як боти ёрдамчи ҳастам. Саволҳои худро ба ман нависед."
-        ]);
-        return;
-    }
-
-    // Agar foydalanuvchi ba'zi kanallarga a'zo bo'lmagan bo'lsa
-    $messageText = "Салом, $firstName! Барои истифодаи бот, лутфан ба каналҳои зерин обуна шавед:";
-
-    // Inline keyboard tugmalarni qo'shish
-    Telegram::sendMessage([
-        'chat_id' => $chatId,
-        'text' => $messageText,
-        'reply_markup' => json_encode([
-            'inline_keyboard' => array_merge($buttons, [
-                [['text' => "✅ Ман обуна шудам", 'callback_data' => 'check_subscription']]
+            'text' => $messageText,
+            'reply_markup' => json_encode([
+                'inline_keyboard' => array_merge($buttons, [
+                    [['text' => "✅ Ман обуна шудам", 'callback_data' => 'check_subscription']]
+                ])
             ])
-        ])
-    ]);
-}
+        ]);
+    }
 
     protected function handleCallbackQuery($callbackQuery)
     {
         $chatId = $callbackQuery['message']['chat']['id'];
         $userId = $callbackQuery['from']['id'];
-        $data = $callbackQuery['data'];
 
-        // Agar foydalanuvchi "✅ Ман обуна шудам" tugmasini bossa
-        if ($data == 'check_subscription') {
-            // Foydalanuvchi barcha kanallarga a'zo ekanligini tekshiramiz
-            $notSubscribedChannels = [];
-
-            foreach ($this->channels as $channel) {
-                if (!$this->isUserMemberOfChannel($chatId, $userId, $channel['id'])) {
-                    $notSubscribedChannels[] = $channel['link'];
-                }
-            }
-
-            if (empty($notSubscribedChannels)) {
-                // Agar foydalanuvchi barcha kanallarga a'zo bo'lsa, unga xabar yuboramiz va tugmalarni olib tashlaymiz
-                $this->saveUserSubscription($userId); // A'zolikni saqlash
-                Telegram::sendMessage([
-                    'chat_id' => $chatId,
-                    'text' => "Ташаккур! Ҳоло шумо метавонед аз бот истифода баред. 🎉",
-                    'reply_markup' => json_encode(['remove_keyboard' => true]) // Tugmalarni olib tashlash
-                ]);
-            } else {
-                // Agar hali ham obuna bo‘lmagan kanallar bo‘lsa, yana eslatma yuboramiz
-                $messageText = "Шумо ҳанӯз ба каналҳои зерин обуна нашудаед:\n";
-                foreach ($notSubscribedChannels as $link) {
-                    $messageText .= "- " . $link . "\n";
-                }
-
-                Telegram::sendMessage([
-                    'chat_id' => $chatId,
-                    'text' => $messageText
-                ]);
+        $notSubscribedChannels = [];
+        foreach ($this->channels as $channel) {
+            if (!$this->isUserMemberOfChannel($userId, $channel['id'])) {
+                $notSubscribedChannels[] = $channel['link'];
             }
         }
+
+        if (!empty($notSubscribedChannels)) {
+            Telegram::sendMessage([
+                'chat_id' => $chatId,
+                'text' => "Сиз ҳали ҳамма каналларга аъзо эмассиз. Илтимос, қуйидаги каналларга аъзо бўлинг:\n\n" . implode("\n", $notSubscribedChannels)
+            ]);
+            return;
+        }
+
+        $this->saveUserSubscription($userId);
+
+        Telegram::sendMessage([
+            'chat_id' => $chatId,
+            'text' => "Ташаккур! Ҳоло шумо метавонед аз бот истифода баред. 🎉",
+            'reply_markup' => json_encode(['remove_keyboard' => true])
+        ]);
     }
-protected function isUserMemberOfChannel($chatId, $userId, $channelId)
-{
-    $apiKey = env('TELEGRAM_BOT_TOKEN');
 
-    $response = Http::get("https://api.telegram.org/bot{$apiKey}/getChatMember", [
-        'chat_id' => $channelId,
-        'user_id' => $userId
-    ]);
+    protected function isUserMemberOfChannel($userId, $channelId)
+    {
+        $apiKey = env('TELEGRAM_BOT_TOKEN');
 
-    $data = $response->json();
+        $response = Http::get("https://api.telegram.org/bot{$apiKey}/getChatMember", [
+            'chat_id' => $channelId,
+            'user_id' => $userId
+        ]);
 
-    Log::info("🔍 Kanal a'zolik tekshiruvi: ", $data);
+        $data = $response->json();
+        Log::info("🔍 Telegram API javobi: " . json_encode($data));
 
-    return isset($data['result']['status']) && in_array($data['result']['status'], ['member', 'administrator', 'creator']);
-}
+        if (!isset($data['ok']) || !$data['ok']) {
+            Log::error("❌ API xato berdi: " . json_encode($data));
+            return false;
+        }
 
+        return isset($data['result']['status']) && in_array($data['result']['status'], ['member', 'administrator', 'creator']);
+    }
 
     protected function saveUserSubscription($userId)
     {
-        // Foydalanuvchi a'zoligini cache ga saqlash (30 kun muddat)
         Cache::put("user_subscribed_{$userId}", true, now()->addDays(30));
     }
 
     protected function isUserSubscribed($userId)
     {
-        // Foydalanuvchi a'zoligini cache dan tekshirish
         return Cache::has("user_subscribed_{$userId}");
     }
 
     protected function handleGeminiRequest($chatId, $text)
     {
-        // Google Gemini API bilan so‘rov yuborish
         $apiKey = env('GEMINI_API_KEY');
         if (!$apiKey) {
             Log::error('GEMINI_API_KEY .env faylda mavjud emas.');
@@ -183,7 +192,7 @@ protected function isUserMemberOfChannel($chatId, $userId, $channelId)
             'contents' => [
                 [
                     'parts' => [
-                        ['text' => $text] // Foydalanuvchi xabari tojik tilida bo'lishi kerak
+                        ['text' => $text]
                     ]
                 ]
             ]
@@ -192,8 +201,6 @@ protected function isUserMemberOfChannel($chatId, $userId, $channelId)
         Log::info('Google Gemini API Response: ', $response->json());
 
         $geminiResponse = $response->json();
-
-        // Xatolik bo‘lsa, foydalanuvchiga bildirish
         if (isset($geminiResponse['error'])) {
             Log::error('Google Gemini API xatosi: ' . json_encode($geminiResponse['error']));
             Telegram::sendMessage([
@@ -203,12 +210,8 @@ protected function isUserMemberOfChannel($chatId, $userId, $channelId)
             return;
         }
 
-        // Javobni olish
         $replyText = $geminiResponse['candidates'][0]['content']['parts'][0]['text'] ?? "Бубахшед, ман ҷавоб дода натавонистам.";
 
-        Log::info("Foydalanuvchiga javob yuborilmoqda: $replyText");
-
-        // Telegramga javob qaytarish
         Telegram::sendMessage([
             'chat_id' => $chatId,
             'text' => $replyText
